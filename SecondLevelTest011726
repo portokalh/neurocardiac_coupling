@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Second-level voxelwise GLM for neurocardiac coupling
+- Explicit intercept
+- Multivariable main-effects model
+- Voxelwise FDR with cluster-extent filtering
+"""
+
+import os
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from nilearn.glm.second_level import SecondLevelModel
+from nilearn import image
+from nilearn.glm import threshold_stats_img
+from nilearn.image import new_img_like
+from scipy.stats import norm
+
+# =====================================================
+# Paths
+# =====================================================
+
+BASE_DIR = "/mnt/newStor/paros/paros_WORK/aashika/resample_mouse_fmri/myICA_separate100_clean_0p1"
+LEVEL1_DIR = os.path.join(BASE_DIR, "level1")
+MASK_IMG_PATH = "/mnt/newStor/paros/paros_WORK/aashika/resample_mouse_fmri/atlas/reference_maps/chass_atlas_mask_0p1.nii.gz"
+METADATA_FILE = "/mnt/newStor/paros/paros_WORK/aashika/resample_mouse_fmri/metadata/cardiac_design_updated3.csv"
+
+# Date-stamped output directory
+TODAY = datetime.today().strftime("%Y%m%d")
+LEVEL2_ROOT = os.path.join(BASE_DIR, "level2_main_effects_FDRcluster", TODAY)
+os.makedirs(LEVEL2_ROOT, exist_ok=True)
+
+mask_img = image.load_img(MASK_IMG_PATH)
+metadata = pd.read_csv(METADATA_FILE)
+
+# =====================================================
+# Genotype coding (rank-safe)
+# =====================================================
+
+metadata["E2_Genotype"] = metadata["Genotype"].apply(
+    lambda x: 1 if x in ["E22", "E22HN"] else 0
+)
+metadata["E3_Genotype"] = metadata["Genotype"].apply(
+    lambda x: 1 if x in ["E33", "E33HN"] else 0
+)
+metadata["E4_Genotype"] = metadata["Genotype"].apply(
+    lambda x: 1 if x in ["E44", "E44HN"] else 0
+)
+
+# E3 is reference → do not include in model
+metadata["HN"] = metadata["Genotype"].astype(str).str.contains("HN").astype(int)
+
+# =====================================================
+# Age category
+# =====================================================
+
+median_age = metadata["Age"].median()
+metadata["Age_cat"] = (metadata["Age"] >= median_age).astype(int)
+
+# =====================================================
+# Cardiac metrics
+# =====================================================
+
+metrics = [
+    "Diastolic_LV_Volume", "Systolic_LV_Volume", "Heart_Rate",
+    "Stroke_Volume", "Ejection_Fraction", "Cardiac_Output",
+    "Diastolic_RV", "Systolic_RV", "Diastolic_LA", "Systolic_LA",
+    "Diastolic_RA", "Systolic_RA", "Diastolic_Myo"
+]
+
+# =====================================================
+# Effects to test (one contrast at a time)
+# =====================================================
+
+effects_to_test = [
+    "Age_cat",
+    "Sex_Male",
+    "Diet_HFD",
+    "Exercise_Yes",
+    "HN",
+    "E2_Genotype",
+    "E4_Genotype"
+]
+
+# =====================================================
+# Analysis loop
+# =====================================================
+
+for effect in effects_to_test:
+    print(f"\n=== Processing effect: {effect} ===")
+
+    for metric in metrics:
+        print(f"  Metric: {metric}")
+
+        for j in range(1, 21):
+            print(f"    ICA {j:02}")
+
+            level1_dir = os.path.join(LEVEL1_DIR, f"level1_ica{j:02}")
+            level2_dir = os.path.join(
+                LEVEL2_ROOT, effect, metric, f"ica{j:02}"
+            )
+            os.makedirs(level2_dir, exist_ok=True)
+
+            level1_files = sorted(
+                f for f in os.listdir(level1_dir) if f.endswith(".nii.gz")
+            )
+
+            matched_files = []
+            matched_rows = []
+
+            for _, row in metadata.iterrows():
+                sid = str(row["Arunno"])
+                hits = [f for f in level1_files if f.startswith(f"{sid}_")]
+                if hits:
+                    matched_files.append(os.path.join(level1_dir, hits[0]))
+                    matched_rows.append(row)
+
+            if not matched_rows:
+                continue
+
+            md = pd.DataFrame(matched_rows)
+
+            # -----------------------------------------
+            # Design matrix (multivariable)
+            # -----------------------------------------
+
+            covariates = [
+                metric,
+                "Age_cat",
+                "Sex_Male",
+                "Diet_HFD",
+                "Exercise_Yes",
+                "HN",
+                "E2_Genotype",
+                "E4_Genotype"
+            ]
+
+            design_matrix = md[covariates].apply(
+                pd.to_numeric, errors="coerce"
+            ).dropna()
+
+            if design_matrix.empty:
+                continue
+
+            # Align images
+            valid_idx = design_matrix.index.tolist()
+            second_level_input = [
+                image.load_img(matched_files[i]) for i in valid_idx
+            ]
+
+            # Center cardiac metric
+            design_matrix[metric] -= design_matrix[metric].mean()
+
+            # Intercept
+            design_matrix["Intercept"] = 1.0
+
+            # -----------------------------------------
+            # Fit model
+            # -----------------------------------------
+
+            model = SecondLevelModel(
+                smoothing_fwhm=0.3,
+                mask_img=mask_img
+            )
+
+            model = model.fit(
+                second_level_input,
+                design_matrix=design_matrix
+            )
+
+            # -----------------------------------------
+            # Contrast: effect of interest
+            # -----------------------------------------
+
+            contrast = np.zeros(design_matrix.shape[1])
+            contrast[list(design_matrix.columns).index(effect)] = 1
+
+            z_map = model.compute_contrast(
+                contrast, output_type="z_score"
+            )
+
+            z_map.to_filename(
+                os.path.join(level2_dir, f"{metric}_{effect}_zmap.nii.gz")
+            )
+
+            # -----------------------------------------
+            # FDR voxelwise threshold + cluster extent
+            # -----------------------------------------
+
+            z_fdr, _ = threshold_stats_img(
+                z_map,
+                alpha=0.05,
+                height_control="fdr",
+                cluster_threshold=10,
+                two_sided=True
+            )
+
+            z_fdr.to_filename(
+                os.path.join(
+                    level2_dir,
+                    f"{metric}_{effect}_zmap_fdr_cluster.nii.gz"
+                )
+            )
+
+            # Optional p-map (for visualization)
+            p_fdr = new_img_like(
+                z_fdr,
+                2 * (1 - norm.cdf(np.abs(z_fdr.get_fdata())))
+            )
+
+            p_fdr.to_filename(
+                os.path.join(
+                    level2_dir,
+                    f"{metric}_{effect}_pmap_fdr_cluster.nii.gz"
+                )
+            )
+
+        print(f"  Done with metric: {metric}")
+
+print("\nAll analyses complete.")
