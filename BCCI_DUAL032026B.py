@@ -3159,3 +3159,657 @@ df_master["abs_delta"].mean()
 df_master["abs_delta"].max()
 
 df_master["abs_delta"].mean()
+
+
+
+
+
+#######################################
+#######RISK FACTORS ##################
+######################################
+
+import os
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from scipy.stats import pearsonr
+
+# =========================================================
+# INPUTS
+# =========================================================
+
+DOMAINS = [
+    "rate_control_meanz",
+    "pumping_meanz",
+    "systolic_function_meanz",
+    "diastolic_function_meanz"
+]
+
+NETWORK_COLS = [col for col in df.columns if col.startswith("Amp_Net")]
+
+# Labels (optional)
+NETWORK_LABELS = {col: col for col in NETWORK_COLS}
+
+# Covariate blocks
+RISK_COLS = ["Age", "Sex_Male", "Mass", "HN"]
+EXERCISE_COLS = ["Exercise_Yes"]
+GENOTYPE_COL = "E4_Genotype"
+
+MIN_N = 20
+OUTDIR_FIG5 = os.path.join(OUTDIR, "Figure5_decomposition")
+os.makedirs(OUTDIR_FIG5, exist_ok=True)
+
+def residualize(y, X):
+    X = sm.add_constant(X)
+    model = sm.OLS(y, X).fit()
+    return model.resid
+
+
+def compute_decomposition(df):
+
+    rows = []
+
+    for domain in DOMAINS:
+
+        for net in NETWORK_COLS:
+
+            cols = [net, domain] + RISK_COLS + EXERCISE_COLS + [GENOTYPE_COL]
+            tmp = df[cols].dropna()
+
+            if len(tmp) < MIN_N:
+                continue
+
+            x = tmp[net].values
+            y = tmp[domain].values
+
+            # --- Model 0: unadjusted
+            r0, _ = pearsonr(x, y)
+
+            # --- Model 1: + risk
+            X_risk = tmp[RISK_COLS]
+            y_r = residualize(tmp[domain], X_risk)
+            x_r = residualize(tmp[net], X_risk)
+            r1, _ = pearsonr(x_r, y_r)
+
+            # --- Model 2: + exercise
+            X_ex = tmp[RISK_COLS + EXERCISE_COLS]
+            y_e = residualize(tmp[domain], X_ex)
+            x_e = residualize(tmp[net], X_ex)
+            r2, _ = pearsonr(x_e, y_e)
+
+            # --- Model 3: + genotype
+            X_full = tmp[RISK_COLS + EXERCISE_COLS + [GENOTYPE_COL]]
+            y_f = residualize(tmp[domain], X_full)
+            x_f = residualize(tmp[net], X_full)
+            r3, _ = pearsonr(x_f, y_f)
+
+            rows.append({
+                "network": net,
+                "network_label": NETWORK_LABELS.get(net, net),
+                "domain": domain,
+
+                "r_unadj": r0,
+                "r_risk": r1,
+                "r_exercise": r2,
+                "r_full": r3,
+
+                "delta_risk": r1 - r0,
+                "delta_exercise": r2 - r1,
+                "delta_genotype": r3 - r2,
+                "delta_total": r3 - r0,
+
+                "abs_total": abs(r3),
+
+                "N": len(tmp)
+            })
+
+    return pd.DataFrame(rows)
+
+
+df_decomp = compute_decomposition(df)
+
+df_decomp.to_csv(
+    os.path.join(OUTDIR_FIG5, "decomposition_full.tsv"),
+    sep="\t",
+    index=False
+)
+
+print("Saved decomposition table")
+
+
+df_summary = (
+    df_decomp
+    .groupby("network_label")
+    .agg({
+        "delta_risk": "mean",
+        "delta_exercise": "mean",
+        "delta_genotype": "mean",
+        "delta_total": "mean",
+        "abs_total": "mean"
+    })
+    .reset_index()
+)
+
+df_summary["abs_total_delta"] = df_summary["delta_total"].abs()
+
+df_summary = df_summary.sort_values("abs_total_delta", ascending=False)
+
+df_summary.to_csv(
+    os.path.join(OUTDIR_FIG5, "decomposition_summary.tsv"),
+    sep="\t",
+    index=False
+)
+
+print(df_summary.head(10))
+
+
+def plot_decomposition(df_summary):
+
+    df_plot = df_summary.copy()
+
+    # clean data
+    df_plot = df_plot.replace([np.inf, -np.inf], np.nan).dropna()
+
+    fig, ax = plt.subplots(figsize=(7, 8))
+
+    y = np.arange(len(df_plot))
+
+    ax.barh(y, df_plot["delta_risk"], label="Risk")
+    ax.barh(y, df_plot["delta_exercise"], left=df_plot["delta_risk"], label="Exercise")
+    ax.barh(
+        y,
+        df_plot["delta_genotype"],
+        left=df_plot["delta_risk"] + df_plot["delta_exercise"],
+        label="Genotype"
+    )
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(df_plot["network_label"])
+
+    ax.axvline(0, color="black", linewidth=1)
+
+    ax.legend()
+    plt.tight_layout()
+
+    outpath = os.path.join(OUTDIR_FIG5, "Figure5_decomposition.png")
+
+    print("Saving to:", outpath)
+
+    plt.savefig(outpath, dpi=150)
+
+    plt.close(fig)
+
+    print("Saved Figure 5 successfully")
+    
+import matplotlib
+matplotlib.use("Agg") 
+plot_decomposition(df_summary)
+
+
+
+###stats
+
+from statsmodels.stats.multitest import multipletests
+
+def compute_full_stats(df):
+
+    rows = []
+
+    for domain in DOMAINS:
+        for net in NETWORK_COLS:
+
+            cols = [net, domain] + RISK_COLS + EXERCISE_COLS + [GENOTYPE_COL]
+            tmp = df[cols].dropna()
+
+            if len(tmp) < MIN_N:
+                continue
+
+            x = tmp[net].values
+            y = tmp[domain].values
+
+            # --- unadjusted
+            r0, p0 = pearsonr(x, y)
+
+            # --- adjusted (full model)
+            X = tmp[RISK_COLS + EXERCISE_COLS + [GENOTYPE_COL]]
+            y_res = residualize(tmp[domain], X)
+            x_res = residualize(tmp[net], X)
+
+            r_full, p_full = pearsonr(x_res, y_res)
+
+            rows.append({
+                "network": net,
+                "network_label": NETWORK_LABELS.get(net, net),
+                "domain": domain,
+
+                "r_unadj": r0,
+                "p_unadj": p0,
+
+                "r_adj": r_full,
+                "p_adj": p_full,
+
+                "delta": r_full - r0,
+
+                "N": len(tmp)
+            })
+
+    df_stats = pd.DataFrame(rows)
+
+    # FDR correction (within domain)
+    df_stats["q_adj"] = np.nan
+
+    for domain in df_stats["domain"].unique():
+        mask = df_stats["domain"] == domain
+        _, qvals, _, _ = multipletests(df_stats.loc[mask, "p_adj"], method="fdr_bh")
+        df_stats.loc[mask, "q_adj"] = qvals
+
+    return df_stats
+
+
+df_stats = compute_full_stats(df)
+
+df_stats.to_csv(
+    os.path.join(OUTDIR_FIG5, "Figure5_full_stats.tsv"),
+    sep="\t",
+    index=False
+)
+
+print("Saved full stats table")
+
+
+
+
+#interactions
+
+def run_interactions(df, networks_of_interest):
+
+    rows = []
+
+    for net in networks_of_interest:
+        for domain in DOMAINS:
+
+            cols = [net, domain] + RISK_COLS + EXERCISE_COLS + [GENOTYPE_COL]
+            tmp = df[cols].dropna()
+
+            if len(tmp) < MIN_N:
+                continue
+
+            formula = f"{domain} ~ {net} * {GENOTYPE_COL} + " + " + ".join(RISK_COLS + EXERCISE_COLS)
+
+            model = sm.OLS.from_formula(formula, data=tmp).fit()
+
+            term = f"{net}:{GENOTYPE_COL}"
+
+            if term in model.params:
+
+                rows.append({
+                    "network": net,
+                    "network_label": NETWORK_LABELS.get(net, net),
+                    "domain": domain,
+
+                    "beta_interaction": model.params[term],
+                    "p_interaction": model.pvalues[term],
+
+                    "N": len(tmp)
+                })
+
+    return pd.DataFrame(rows)
+
+
+KEY_NETWORKS = [
+    "Amp_Net02",  # mPFC–ACC
+    "Amp_Net12",  # Olfactory Bulb
+    "Amp_Net05"   # Somatomotor
+]
+
+df_interact = run_interactions(df, KEY_NETWORKS)
+
+df_interact.to_csv(
+    os.path.join(OUTDIR_FIG5, "Figure5_interactions.tsv"),
+    sep="\t",
+    index=False
+)
+
+print(df_interact)
+
+
+
+
+
+# =========================================
+# FIGURE 5 COMPOSITE SCRIPT (Publication-ready)
+# =========================================
+
+
+
+
+# =============================================================================
+# FIGURE 5 — FINAL (MATCHED TO YOUR ACTUAL TABLES)
+# =============================================================================
+
+import os
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from statsmodels.stats.multitest import multipletests
+
+# =============================================================================
+# SETTINGS
+# =============================================================================
+
+FIG5_OUT = OUTDIR_FIG5
+os.makedirs(FIG5_OUT, exist_ok=True)
+
+DELTA_LIM = 0.25
+
+# =============================================================================
+# NETWORK NAME MAP
+# =============================================================================
+
+NETWORK_NAME_MAP = {
+    "Amp_Net01": "Midline Autonomic Axis",
+    "Amp_Net02": "Anterior Medial",
+    "Amp_Net03": "Posterior Association",
+    "Amp_Net04": "Lateral Sensorimotor–Insular",
+    "Amp_Net05": "Primary Sensorimotor",
+    "Amp_Net06": "Ventral Temporal–Perirhinal",
+    "Amp_Net07": "Olfactory–Basal Forebrain",
+    "Amp_Net08": "Temporal–Insular",
+    "Amp_Net09": "Thalamo–Arousal",
+    "Amp_Net10": "Tecto–Cerebellar Midline",
+    "Amp_Net11": "Lateral Cerebellar",
+    "Amp_Net12": "Olfactory Bulb"
+}
+
+NETWORK_ORDER = [
+    "Midline Autonomic Axis",
+    "Anterior Medial",
+    "Thalamo–Arousal",
+    "Lateral Sensorimotor–Insular",
+    "Primary Sensorimotor",
+    "Posterior Association",
+    "Temporal–Insular",
+    "Ventral Temporal–Perirhinal",
+    "Olfactory–Basal Forebrain",
+    "Olfactory Bulb",
+    "Tecto–Cerebellar Midline",
+    "Lateral Cerebellar"
+]
+
+# =============================================================================
+# DOMAIN RENAME
+# =============================================================================
+
+DOMAIN_RENAME = {
+    "rate_control_meanz": "heart_rate",
+    "rate_control": "heart_rate",
+    "pumping_meanz": "pump",
+    "pumping": "pump",
+    "systolic_function_meanz": "systolic",
+    "systolic_function": "systolic",
+    "diastolic_function_meanz": "diastolic",
+    "diastolic_function": "diastolic"
+}
+
+DOMAIN_ORDER = ["heart_rate", "pump", "systolic", "diastolic"]
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def apply_network_names(df):
+    df = df.copy()
+
+    if "network_name" not in df.columns:
+        if "network" in df.columns:
+            df["network_name"] = df["network"].map(NETWORK_NAME_MAP).fillna(df["network"])
+        elif "network_label" in df.columns:
+            df["network_name"] = df["network_label"].map(NETWORK_NAME_MAP).fillna(df["network_label"])
+        else:
+            raise ValueError(f"No network column found. Columns: {df.columns.tolist()}")
+
+    df["network_name"] = pd.Categorical(
+        df["network_name"],
+        categories=NETWORK_ORDER,
+        ordered=True
+    )
+
+    return df
+
+
+def rename_domains(df):
+    df = df.copy()
+    if "domain" in df.columns:
+        df["domain"] = df["domain"].replace(DOMAIN_RENAME)
+        df["domain"] = pd.Categorical(
+            df["domain"],
+            categories=DOMAIN_ORDER,
+            ordered=True
+        )
+    return df
+
+
+# =============================================================================
+# PANEL A — STACKED DECOMPOSITION SUMMARY
+# uses df_summary
+# =============================================================================
+
+def plot_panel_A(ax, df_summary):
+    df_plot = df_summary.copy()
+
+    # use network_name if available; otherwise map from network_label
+    if "network_name" not in df_plot.columns:
+        if "network_label" in df_plot.columns:
+            df_plot["network_name"] = df_plot["network_label"].map(NETWORK_NAME_MAP).fillna(df_plot["network_label"])
+        else:
+            raise ValueError("df_summary needs network_label or network_name")
+
+    df_plot["network_name"] = pd.Categorical(
+        df_plot["network_name"],
+        categories=NETWORK_ORDER,
+        ordered=True
+    )
+    df_plot = df_plot.sort_values("abs_total_delta", ascending=True)
+
+    for col in ["delta_risk", "delta_exercise", "delta_genotype"]:
+        if col not in df_plot.columns:
+            df_plot[col] = 0.0
+
+    y = np.arange(len(df_plot))
+
+    ax.barh(y, df_plot["delta_risk"], color="#4c72b0", label="risk")
+    ax.barh(
+        y,
+        df_plot["delta_exercise"],
+        left=df_plot["delta_risk"],
+        color="#dd8452",
+        label="exercise"
+    )
+    ax.barh(
+        y,
+        df_plot["delta_genotype"],
+        left=df_plot["delta_risk"] + df_plot["delta_exercise"],
+        color="#55a868",
+        label="genotype"
+    )
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(df_plot["network_name"].astype(str))
+    ax.axvline(0, color="black", linewidth=1)
+    ax.set_xlim(-DELTA_LIM, DELTA_LIM)
+    ax.set_title("A. Decomposition summary")
+    ax.set_xlabel("Δ correlation")
+
+
+# =============================================================================
+# PANEL B — TOTAL SHIFT MAGNITUDE
+# uses df_summary
+# =============================================================================
+
+def plot_panel_B(ax, df_summary):
+    df_plot = df_summary.copy()
+
+    if "network_name" not in df_plot.columns:
+        if "network_label" in df_plot.columns:
+            df_plot["network_name"] = df_plot["network_label"].map(NETWORK_NAME_MAP).fillna(df_plot["network_label"])
+        else:
+            raise ValueError("df_summary needs network_label or network_name")
+
+    df_plot["network_name"] = pd.Categorical(
+        df_plot["network_name"],
+        categories=NETWORK_ORDER,
+        ordered=True
+    )
+    df_plot = df_plot.sort_values("abs_total_delta", ascending=True)
+
+    ax.barh(
+        df_plot["network_name"].astype(str),
+        df_plot["abs_total_delta"],
+        color="gray"
+    )
+    ax.set_title("B. Total shift magnitude")
+    ax.set_xlabel("|Δ total|")
+    ax.set_ylabel("")
+
+
+# =============================================================================
+# PANEL C — DOMAIN-SPECIFIC HEATMAP
+# uses df_decomp
+# =============================================================================
+
+def plot_panel_C(ax, df_decomp):
+    df_plot = rename_domains(apply_network_names(df_decomp))
+
+    heat = df_plot.pivot_table(
+        index="network_name",
+        columns="domain",
+        values="delta_risk",
+        aggfunc="mean",
+        observed=False
+    )
+
+    heat = heat.reindex(index=NETWORK_ORDER, columns=DOMAIN_ORDER)
+
+    sns.heatmap(
+        heat,
+        cmap="coolwarm",
+        center=0,
+        ax=ax,
+        cbar_kws={"label": "Δ risk"}
+    )
+
+    ax.set_title("C. Risk component by domain")
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+
+
+# =============================================================================
+# PANEL D — INTERACTION FOREST / BAR
+# uses df_interact
+# =============================================================================
+
+def plot_panel_D(ax, df_interact):
+    df_plot = rename_domains(apply_network_names(df_interact)).copy()
+
+    # FDR within all interaction rows
+    if "q_interaction" not in df_plot.columns:
+        df_plot["q_interaction"] = multipletests(
+            df_plot["p_interaction"].values,
+            method="fdr_bh"
+        )[1]
+
+    # approximate CI from p-values
+    p = np.clip(df_plot["p_interaction"].values.astype(float), 1e-10, 1.0)
+    z = norm.ppf(1 - p / 2.0)
+    z[~np.isfinite(z)] = 1.96
+    z[z == 0] = 1.96
+
+    beta = df_plot["beta_interaction"].values.astype(float)
+    se = np.abs(beta) / z
+
+    df_plot["ci_low"] = beta - 1.96 * se
+    df_plot["ci_high"] = beta + 1.96 * se
+
+    df_plot["label"] = (
+        df_plot["network_name"].astype(str) +
+        " | " +
+        df_plot["domain"].astype(str)
+    )
+
+    df_plot = df_plot.sort_values("beta_interaction", ascending=True).reset_index(drop=True)
+
+    y = np.arange(len(df_plot))
+
+    colors = [
+        "#d62728" if q < 0.05 else "#ff9896" if p < 0.05 else "gray"
+        for p, q in zip(df_plot["p_interaction"], df_plot["q_interaction"])
+    ]
+
+    ax.hlines(
+        y,
+        df_plot["ci_low"],
+        df_plot["ci_high"],
+        color=colors,
+        linewidth=2
+    )
+    ax.scatter(
+        df_plot["beta_interaction"],
+        y,
+        color=colors,
+        s=45,
+        zorder=3
+    )
+
+    ax.axvline(0, linestyle="--", color="black", linewidth=1)
+    ax.set_yticks(y)
+    ax.set_yticklabels(df_plot["label"])
+    ax.set_title("D. Genotype interactions")
+    ax.set_xlabel("Interaction β")
+    ax.set_ylabel("")
+
+
+# =============================================================================
+# MASTER FUNCTION
+# =============================================================================
+
+def plot_figure5(df_summary, df_decomp, df_interact, outdir):
+    print("\nBuilding Figure 5 FINAL")
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+    plot_panel_A(axes[0, 0], df_summary)
+    plot_panel_B(axes[0, 1], df_summary)
+    plot_panel_C(axes[1, 0], df_decomp)
+    plot_panel_D(axes[1, 1], df_interact)
+
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color="#4c72b0", label="risk"),
+        plt.Rectangle((0, 0), 1, 1, color="#dd8452", label="exercise"),
+        plt.Rectangle((0, 0), 1, 1, color="#55a868", label="genotype")
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False)
+
+    plt.tight_layout(rect=[0, 0.05, 1, 1])
+
+    out_path = os.path.join(outdir, "Figure5_FINAL.png")
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved: {out_path}")
+
+
+# =============================================================================
+# CALL
+# =============================================================================
+
+plot_figure5(
+    df_summary=df_summary,
+    df_decomp=df_decomp,
+    df_interact=df_interact,
+    outdir=OUTDIR_FIG5
+)
